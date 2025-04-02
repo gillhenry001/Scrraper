@@ -13,7 +13,8 @@ from bs4 import BeautifulSoup
 import requests
 import pandas as pd
 from config import CRAIGSLIST_CITIES, CRAIGSLIST_BASE_URL, KEYWORDS, REMOTE_KEYWORDS, NON_REMOTE_KEYWORDS
-from utils import random_delay, save_to_csv, load_from_csv, remove_duplicates
+from utils import random_delay, save_to_csv, load_from_csv, remove_duplicates, get_random_user_agent
+import traceback
 
 class CraigslistScraper:
     def __init__(self):
@@ -26,39 +27,69 @@ class CraigslistScraper:
         
     def _setup_driver(self):
         """Set up and return a Chrome WebDriver instance."""
-        chrome_options = Options()
-        if self.use_headless:
-            chrome_options.add_argument("--headless=new")  # Updated for newer Chrome versions
-        
-        chrome_options.add_argument("--window-size=1920,1080")
-        chrome_options.add_argument("--disable-notifications")
-        chrome_options.add_argument("--disable-infobars")
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        
-        # Check if drivers directory exists
-        drivers_dir = "drivers"
-        if not os.path.exists(drivers_dir):
-            os.makedirs(drivers_dir, exist_ok=True)
-            raise FileNotFoundError(f"Please place chromedriver in the '{drivers_dir}' directory")
-        
-        # Determine the driver path based on OS
-        if os.name == 'nt':  # Windows
-            driver_path = os.path.join(drivers_dir, "chromedriver.exe")
-        else:  # macOS or Linux
-            driver_path = os.path.join(drivers_dir, "chromedriver")
-        
-        # Check if driver exists
-        if not os.path.exists(driver_path):
-            raise FileNotFoundError(f"ChromeDriver not found at {driver_path}. Please place the correct ChromeDriver in the '{drivers_dir}' directory.")
-        
         try:
+            chrome_options = Options()
+            if self.use_headless:
+                chrome_options.add_argument("--headless=new")  # Updated for newer Chrome versions
+            
+            # Add additional Chrome options for stability
+            chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument("--disable-notifications")
+            chrome_options.add_argument("--disable-infobars")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--remote-debugging-port=9222")  # Add debugging port
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")  # Hide automation
+            
+            # Add user agent
+            chrome_options.add_argument(f"user-agent={get_random_user_agent()}")
+            
+            print("Setting up ChromeDriver...")
+            
+            # Use webdriver_manager with specific version
+            from webdriver_manager.chrome import ChromeDriverManager
+            from selenium.webdriver.chrome.service import Service
+            
+            # Get Chrome version
+            try:
+                import subprocess
+                chrome_version = subprocess.check_output(
+                    ['reg', 'query', 'HKEY_CURRENT_USER\\Software\\Google\\Chrome\\BLBeacon', '/v', 'version'],
+                    stderr=subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL
+                ).decode('UTF-8').strip().split()[-1]
+                print(f"Detected Chrome version: {chrome_version}")
+            except:
+                print("Could not detect Chrome version, using default driver")
+                chrome_version = None
+            
+            # Install ChromeDriver
+            driver_manager = ChromeDriverManager()
+            if chrome_version:
+                driver_path = driver_manager.install()
+                print(f"ChromeDriver installed at: {driver_path}")
+            else:
+                driver_path = driver_manager.install()
+                print(f"ChromeDriver installed at: {driver_path}")
+            
             service = Service(driver_path)
-            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Create driver with increased timeout
+            driver = webdriver.Chrome(
+                service=service,
+                options=chrome_options
+            )
+            
+            # Set page load timeout
+            driver.set_page_load_timeout(30)
+            print("Chrome WebDriver initialized successfully")
             return driver
+            
         except Exception as e:
+            print(f"Error setting up Chrome WebDriver: {str(e)}")
+            print("Full error details:", traceback.format_exc())
             raise
     
     def _load_page_with_retry(self, url, max_retries=3):
@@ -307,6 +338,22 @@ class CraigslistScraper:
         
         return df
         
+    def _replace_empty_with_null(self, df):
+        """Replace empty values with 'null' in rows that have at least some data."""
+        # Create a copy to avoid modifying the original
+        df_copy = df.copy()
+        
+        # Get rows that have at least some data (not all columns empty)
+        has_data_mask = df_copy.notna().any(axis=1) & (df_copy != "").any(axis=1)
+        
+        # For rows with data, replace empty values with 'null'
+        for idx in df_copy[has_data_mask].index:
+            for col in df_copy.columns:
+                if pd.isna(df_copy.at[idx, col]) or df_copy.at[idx, col] == "":
+                    df_copy.at[idx, col] = "null"
+        
+        return df_copy
+
     def scrape_details(self, df=None, start_index=0, max_listings=None):
         """
         PHASE 2 - STEP 2: Visit each listing and extract email, description, and remote status.
@@ -583,6 +630,10 @@ class CraigslistScraper:
         
         # Final save to ensure all data is saved
         final_df = pd.DataFrame(results)
+        
+        # Replace empty values with 'null' before saving
+        final_df = self._replace_empty_with_null(final_df)
+        
         save_to_csv(final_df, self.output_file)
         
         return final_df

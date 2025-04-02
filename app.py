@@ -1,35 +1,51 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
-import shutil
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ValidationError
+from typing import Optional, Dict, Any, List
 import os
-from datetime import datetime
-import asyncio
 from scraper import CraigslistScraper
 from config import CRAIGSLIST_CITIES, CRAIGSLIST_BASE_URL, KEYWORDS, REMOTE_KEYWORDS, NON_REMOTE_KEYWORDS
 import json
-from dotenv import load_dotenv
-import logging
 import pandas as pd
+from dotenv import load_dotenv
+import base64
+import asyncio
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("logs/api.log"),
-        logging.StreamHandler()
-    ]
+# Create FastAPI app and router
+app = FastAPI(title="Craigslist Scraper API", 
+             description="API for scraping and managing Craigslist job listings",
+             version="1.0.0")
+router = APIRouter(prefix="/api")
+
+# Configure CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods
+    allow_headers=["*"],  # Allow all headers
+    expose_headers=["*"],  # Expose all headers
+    max_age=3600,  # Cache preflight requests for 1 hour
 )
-logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Craigslist Scraper API")
+# Global variables
+scraper = None
+scraping_status = {
+    "is_running": False,
+    "progress": 0,
+    "total_listings": 0,
+    "processed_listings": 0,
+    "current_phase": "null",
+    "last_completed": None,
+    "no_results": False,
+    "error": None
+}
 
-# Global variables to store configuration and scraper instance
 current_config = {
     "cities": CRAIGSLIST_CITIES,
     "base_url": CRAIGSLIST_BASE_URL,
@@ -47,20 +63,12 @@ current_config = {
     "max_delay_between_batches": float(os.getenv('MAX_DELAY_BETWEEN_BATCHES', 30))
 }
 
-scraper = None
-scraping_status = {
-    "is_running": False,
-    "status": "idle",
-    "message": "",
-    "error": None
-}
-
 class ConfigUpdate(BaseModel):
-    cities: Optional[list] = None
+    cities: Optional[List[str]] = None
     base_url: Optional[str] = None
-    keywords: Optional[list] = None
-    remote_keywords: Optional[list] = None
-    non_remote_keywords: Optional[list] = None
+    keywords: Optional[List[str]] = None
+    remote_keywords: Optional[List[str]] = None
+    non_remote_keywords: Optional[List[str]] = None
     use_headless: Optional[bool] = None
     batch_size: Optional[int] = None
     max_retries: Optional[int] = None
@@ -82,33 +90,77 @@ NON_REMOTE_KEYWORDS = {json.dumps(config['non_remote_keywords'], indent=4)}
     with open('config.py', 'w') as f:
         f.write(config_content)
 
-@app.post("/start-scraping")
+def reset_status():
+    """Reset the scraping status to default values."""
+    global scraping_status
+    scraping_status = {
+        "is_running": False,
+        "progress": 0,
+        "total_listings": 0,
+        "processed_listings": 0,
+        "current_phase": "Not Started",
+        "last_completed": None,
+        "no_results": False,
+        "error": None
+    }
+
+@router.get("/")
+async def root():
+    """Root endpoint with API information."""
+    response = {
+        "name": "Craigslist Scraper API",
+        "version": "1.0.0",
+        "status": "running",
+        "endpoints": {
+            "GET /api": "This information",
+            "POST /api/start-scraping": "Start the scraping process",
+            "GET /api/scraping-status": "Get current scraping status",
+            "GET /api/download-results": "Download scraped results as CSV",
+            "POST /api/update-config": "Update scraper configuration",
+            "GET /api/current-config": "Get current configuration",
+            "POST /api/cleanup": "Clean up resources and stop scraping"
+        }
+    }
+    print("\n=== Root Endpoint Response ===")
+    print(json.dumps(response, indent=2))
+    return response
+
+@router.post("/start-scraping")
 async def start_scraping(background_tasks: BackgroundTasks):
     """Start the scraping process in the background."""
     global scraper, scraping_status
     
     if scraping_status["is_running"]:
+        print("\n=== Start Scraping Error ===")
+        print("Scraping is already running")
         raise HTTPException(status_code=400, detail="Scraping is already running")
     
     try:
+        # Reset status if not in no_results state
+        if not scraping_status["no_results"]:
+            reset_status()
+        
         scraper = CraigslistScraper()
         scraping_status["is_running"] = True
-        scraping_status["status"] = "running"
-        scraping_status["message"] = "Scraping started successfully"
-        scraping_status["error"] = None
+        scraping_status["progress"] = 0
+        scraping_status["current_phase"] = None
+        scraping_status["last_completed"] = None
         
         background_tasks.add_task(run_scraper)
-        return JSONResponse(
-            content={
-                "message": "Scraping started successfully",
-                "status": "running"
-            }
-        )
+        response = {
+            "message": "Scraping started successfully",
+            "status": "running"
+        }
+        print("\n=== Start Scraping Response ===")
+        print(json.dumps(response, indent=2))
+        return JSONResponse(content=response)
     except Exception as e:
+        print("\n=== Start Scraping Error ===")
+        print(f"Error: {str(e)}")
         scraping_status["is_running"] = False
-        scraping_status["status"] = "error"
-        scraping_status["message"] = "Failed to start scraping"
-        scraping_status["error"] = str(e)
+        scraping_status["progress"] = 0
+        scraping_status["current_phase"] = None
+        scraping_status["last_completed"] = None
         scraper = None
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -118,99 +170,289 @@ async def run_scraper():
     
     try:
         # Phase 1: Scrape listings
-        scraping_status["message"] = "Phase 1: Scraping listings"
+        scraping_status.update({
+            "is_running": True,
+            "progress": 0,
+            "current_phase": "Phase 1: Scraping listings",
+            "last_completed": "Starting Phase 1",
+            "completed": False,
+            "error": False,
+            "no_results": False
+        })
+        
         df = scraper.scrape_listings()
         
-        if not df.empty:
-            # Phase 2 - Step 1: Clean listings
-            scraping_status["message"] = "Phase 2: Cleaning listings"
-            df = scraper.clean_listings(df)
+        if df.empty:
+            scraping_status.update({
+                "is_running": False,
+                "progress": 0,
+                "current_phase": "Completed",
+                "last_completed": "No listings found",
+                "completed": True,
+                "error": False,
+                "no_results": True
+            })
+            return
             
-            # Phase 2 - Step 2: Scrape details
-            scraping_status["message"] = "Phase 2: Scraping details"
-            df = scraper.scrape_details(df)
-            
-            # Update status for successful completion
-            scraping_status["is_running"] = False
-            scraping_status["status"] = "completed"
-            scraping_status["message"] = "Scraping Complete"
-            scraping_status["error"] = None
-        else:
-            # Update status for no results
-            scraping_status["is_running"] = False
-            scraping_status["status"] = "completed"
-            scraping_status["message"] = "No listings found"
-            scraping_status["error"] = None
-            
+        # Phase 2 - Step 1: Clean listings
+        scraping_status.update({
+            "is_running": True,
+            "progress": 30,
+            "current_phase": "Phase 2: Cleaning listings",
+            "last_completed": f"Found {len(df)} listings",
+            "completed": False,
+            "error": False,
+            "no_results": False
+        })
+        
+        df = scraper.clean_listings(df)
+        
+        # Phase 2 - Step 2: Scrape details
+        scraping_status.update({
+            "is_running": True,
+            "progress": 50,
+            "current_phase": "Phase 2: Scraping details",
+            "last_completed": f"Processing {len(df)} listings",
+            "completed": False,
+            "error": False,
+            "no_results": False
+        })
+        
+        results_df = scraper.scrape_details(df)
+        
+        # Update final status
+        scraping_status.update({
+            "is_running": False,
+            "progress": 100,
+            "current_phase": "Completed",
+            "last_completed": "Scraping Complete",
+            "completed": True,
+            "error": False,
+            "no_results": False
+        })
+        
     except Exception as e:
-        # Update status for error
-        scraping_status["is_running"] = False
-        scraping_status["status"] = "error"
-        scraping_status["message"] = "Error during scraping"
+        scraping_status.update({
+            "is_running": False,
+            "progress": 0,
+            "current_phase": "Error",
+            "last_completed": "Error during scraping",
+            "completed": False,
+            "error": True,
+            "no_results": False
+        })
         scraping_status["error"] = str(e)
-        print(f"Error during scraping: {str(e)}")
+        raise
     finally:
         if scraper:
             scraper.close()
             scraper = None
 
-@app.get("/scraping-status")
+@router.get("/scraping-status")
 async def get_scraping_status():
     """Get the current status of the scraping process."""
-    return scraping_status
-
-@app.get("/download-results")
-async def download_results():
-    """Download the results CSV file."""
-    output_file = os.getenv('OUTPUT_FILE', 'output/results.csv')
+    # Create a copy of the status to avoid race conditions
+    status = scraping_status.copy()
     
-    if not os.path.exists(output_file):
-        raise HTTPException(status_code=404, detail="Results file not found")
-    
-    return FileResponse(
-        output_file,
-        media_type='text/csv',
-        filename='craigslist_results.csv'
+    # Update the completed flag based on current state
+    status["completed"] = (
+        not status["is_running"] and 
+        status["current_phase"] == "Completed" and 
+        status["last_completed"] == "Scraping Complete"
     )
+    
+    # Update the error flag based on current state
+    status["error"] = (
+        not status["is_running"] and 
+        status["current_phase"] == "Error"
+    )
+    
+    # Update the no_results flag based on current state
+    status["no_results"] = (
+        not status["is_running"] and 
+        status["last_completed"] == "No listings found"
+    )
+    
+    print("\n=== Scraping Status Response ===")
+    print(json.dumps(status, indent=2))
+    return status
 
-@app.post("/update-config")
-async def update_config(config_update: ConfigUpdate):
+@router.get("/download-results")
+async def download_results():
+    """Download scraped results as CSV."""
+    try:
+        output_file = os.getenv('OUTPUT_FILE', 'output/results.csv')
+        
+        if not os.path.exists(output_file):
+            print("\n=== Download Results Error ===")
+            print("No results found. Please run the scraper first.")
+            raise HTTPException(
+                status_code=404,
+                detail="No results found. Please run the scraper first."
+            )
+        
+        # Read the CSV file
+        with open(output_file, 'rb') as file:
+            file_content = file.read()
+            
+        # Encode the content to base64
+        base64_content = base64.b64encode(file_content).decode('utf-8')
+        
+        # Create response with metadata
+        response = {
+            "filename": "scraped_results.csv",
+            "content": base64_content,  # Send the complete base64 content
+            "content_type": "text/csv",
+            "size": len(file_content)
+        }
+        
+        # Log only the size and filename for debugging
+        print("\n=== Download Results Response ===")
+        print(f"Filename: {response['filename']}")
+        print(f"Size: {response['size']} bytes")
+        print(f"Base64 length: {len(response['content'])} characters")
+        
+        return response
+        
+    except Exception as e:
+        print("\n=== Download Results Error ===")
+        print(f"Error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error downloading results: {str(e)}"
+        )
+
+@router.post("/update-config")
+async def update_config(request: Request, config_update: ConfigUpdate):
     """Update the configuration values."""
-    global current_config
+    global current_config, CRAIGSLIST_CITIES, CRAIGSLIST_BASE_URL, KEYWORDS, REMOTE_KEYWORDS, NON_REMOTE_KEYWORDS
     
-    # Update only the provided fields
-    update_dict = config_update.dict(exclude_unset=True)
-    current_config.update(update_dict)
-    
-    # Update the config file
-    update_config_file(current_config)
-    
-    return {"message": "Configuration updated successfully", "config": current_config}
+    try:
+        # Log the raw request body
+        body = await request.body()
+        print("\n=== Update Config Request ===")
+        print("Raw request body:", body.decode())
+        
+        # Log the parsed config update
+        print("\nParsed config update:", json.dumps(config_update.dict(), indent=2))
+        
+        # Update only the provided fields
+        update_dict = config_update.dict(exclude_unset=True)
+        
+        # Validate the update before applying
+        if 'cities' in update_dict and not isinstance(update_dict['cities'], list):
+            raise HTTPException(status_code=422, detail="Cities must be a list")
+            
+        if 'keywords' in update_dict and not isinstance(update_dict['keywords'], list):
+            raise HTTPException(status_code=422, detail="Keywords must be a list")
+            
+        if 'use_headless' in update_dict and not isinstance(update_dict['use_headless'], bool):
+            raise HTTPException(status_code=422, detail="use_headless must be a boolean")
+            
+        if 'batch_size' in update_dict and not isinstance(update_dict['batch_size'], int):
+            raise HTTPException(status_code=422, detail="batch_size must be an integer")
+            
+        if 'max_retries' in update_dict and not isinstance(update_dict['max_retries'], int):
+            raise HTTPException(status_code=422, detail="max_retries must be an integer")
+        
+        # Update the current config
+        current_config.update(update_dict)
+        
+        # Update the config file
+        update_config_file(current_config)
+        
+        # Reload the config module to get updated values
+        import importlib
+        import config
+        importlib.reload(config)
+        
+        # Update the global variables with new values
+        CRAIGSLIST_CITIES = config.CRAIGSLIST_CITIES
+        CRAIGSLIST_BASE_URL = config.CRAIGSLIST_BASE_URL
+        KEYWORDS = config.KEYWORDS
+        REMOTE_KEYWORDS = config.REMOTE_KEYWORDS
+        NON_REMOTE_KEYWORDS = config.NON_REMOTE_KEYWORDS
+        
+        response = {
+            "message": "Configuration updated successfully",
+            "config": current_config
+        }
+        
+        print("\n=== Update Config Response ===")
+        print(json.dumps(response, indent=2))
+        return response
+        
+    except ValidationError as e:
+        print("\n=== Update Config Validation Error ===")
+        print("Validation error:", json.dumps(e.errors(), indent=2))
+        raise HTTPException(status_code=422, detail=e.errors())
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print("\n=== Update Config Error ===")
+        print(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error updating configuration: {str(e)}")
 
-@app.get("/current-config")
+@router.get("/current-config")
 async def get_current_config():
     """Get the current configuration values."""
+    print("\n=== Current Config Response ===")
+    print(json.dumps(current_config, indent=2))
     return current_config
 
-@app.post("/cleanup")
+@router.post("/cleanup")
 async def cleanup():
     """Clean up resources and stop any running scraping process."""
-    global scraper, scraping_status
+    global scraping_status, scraper
     
-    if scraper:
-        scraper.close()
-        scraper = None
-    
-    scraping_status["is_running"] = False
-    scraping_status["status"] = "idle"
-    scraping_status["message"] = "Cleanup completed"
-    scraping_status["error"] = None
-    
-    return {"message": "Cleanup completed successfully"}
+    try:
+        # Close the scraper if it's running
+        if scraper:
+            scraper.close()
+            scraper = None
+        
+        # Clean up output files
+        output_dir = "output"
+        if os.path.exists(output_dir):
+            for filename in os.listdir(output_dir):
+                file_path = os.path.join(output_dir, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    print(f"Error deleting {file_path}: {str(e)}")
+        
+        # Reset status to default values
+        scraping_status = {
+            "is_running": False,
+            "progress": 0,
+            "total_listings": 0,
+            "processed_listings": 0,
+            "current_phase": "Not Started",
+            "last_completed": None,
+            "no_results": False,
+            "error": None
+        }
+        
+        print("\n=== Cleanup Response ===")
+        print("Files cleaned from output directory")
+        print("Status reset to default values")
+        print(json.dumps(scraping_status, indent=2))
+        
+        return {
+            "message": "Cleanup completed successfully",
+            "files_cleaned": True,
+            "status_reset": True
+        }
+    except Exception as e:
+        print("\n=== Cleanup Error ===")
+        print(f"Error during cleanup: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Include the router in the app
+app.include_router(router)
 
 if __name__ == "__main__":
     import uvicorn
-    # Get port from environment variable, default to 8000 if not set
     port = int(os.getenv('PORT', 8000))
-    logger.info(f"Starting server on port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port) 
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True) 
